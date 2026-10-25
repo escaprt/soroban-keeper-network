@@ -1,8 +1,19 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol,
+    contract, contractclient, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol,
 };
+
+#[contractclient(name = "RegistryClient")]
+pub trait RegistryInterface {
+    fn set_fee_bps(e: Env, admin: Address, new_bps: u32);
+    fn set_min_reward(e: Env, admin: Address, min_reward: i128);
+    fn set_reputation_floor(e: Env, admin: Address, floor_bps: u32);
+    fn pause(e: Env, admin: Address);
+    fn unpause(e: Env, admin: Address);
+    fn transfer_admin(e: Env, admin: Address, new_admin: Address);
+    fn upgrade(e: Env, admin: Address, new_wasm_hash: BytesN<32>);
+}
 
 pub const ONE_TOKEN: i128 = 10_000_000; // 10^7 stroops (7 decimals)
 pub const DEFAULT_PROPOSAL_THRESHOLD: i128 = 100_000 * ONE_TOKEN; // 100,000 KPRS
@@ -36,6 +47,8 @@ pub enum GovernanceError {
     Unauthorized = 15,
     ArithmeticOverflow = 16,
     InsufficientVotingPower = 17,
+    ProposalAlreadyCancelled = 18,
+    CannotCancelExecuted = 19,
 }
 
 #[contracttype]
@@ -65,6 +78,7 @@ pub enum GovernableAction {
     SetReputationFloor(u32),
     PauseRegistry,
     UnpauseRegistry,
+    TransferRegistryAdmin(Address),
 
     // ── Treasury Parameters ──
     AddTreasuryRecipient(Address, u32),
@@ -535,8 +549,71 @@ impl GovernanceContract {
             return Err(GovernanceError::TimelockNotElapsed);
         }
 
-        // Apply parameter mutations if meta-governance action
+        // Apply action effects
         match &proposal.action {
+            GovernableAction::SetFeeBps(bps) => {
+                let registry_addr: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Registry)
+                    .ok_or(GovernanceError::NotInitialized)?;
+                let registry_client = RegistryClient::new(&env, &registry_addr);
+                registry_client.set_fee_bps(&env.current_contract_address(), bps);
+            }
+            GovernableAction::SetMinReward(min) => {
+                let registry_addr: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Registry)
+                    .ok_or(GovernanceError::NotInitialized)?;
+                let registry_client = RegistryClient::new(&env, &registry_addr);
+                registry_client.set_min_reward(&env.current_contract_address(), min);
+            }
+            GovernableAction::SetReputationFloor(floor) => {
+                let registry_addr: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Registry)
+                    .ok_or(GovernanceError::NotInitialized)?;
+                let registry_client = RegistryClient::new(&env, &registry_addr);
+                registry_client.set_reputation_floor(&env.current_contract_address(), floor);
+            }
+            GovernableAction::PauseRegistry => {
+                let registry_addr: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Registry)
+                    .ok_or(GovernanceError::NotInitialized)?;
+                let registry_client = RegistryClient::new(&env, &registry_addr);
+                registry_client.pause(&env.current_contract_address());
+            }
+            GovernableAction::UnpauseRegistry => {
+                let registry_addr: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Registry)
+                    .ok_or(GovernanceError::NotInitialized)?;
+                let registry_client = RegistryClient::new(&env, &registry_addr);
+                registry_client.unpause(&env.current_contract_address());
+            }
+            GovernableAction::TransferRegistryAdmin(new_admin) => {
+                let registry_addr: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Registry)
+                    .ok_or(GovernanceError::NotInitialized)?;
+                let registry_client = RegistryClient::new(&env, &registry_addr);
+                registry_client.transfer_admin(&env.current_contract_address(), new_admin);
+            }
+            GovernableAction::UpgradeRegistry(wasm_hash) => {
+                let registry_addr: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Registry)
+                    .ok_or(GovernanceError::NotInitialized)?;
+                let registry_client = RegistryClient::new(&env, &registry_addr);
+                registry_client.upgrade(&env.current_contract_address(), wasm_hash);
+            }
             GovernableAction::SetVotingPeriod(period) => {
                 env.storage().instance().set(&DataKey::VotingPeriod, period);
             }
@@ -568,6 +645,66 @@ impl GovernanceContract {
 
         env.events().publish(
             (Symbol::new(&env, "proposal_executed"), proposal_id),
+            (),
+        );
+
+        Ok(())
+    }
+
+    /// Cancels a proposal before execution.
+    ///
+    /// Authorized callers:
+    /// - The original `proposer`: Can cancel their proposal at any time prior to execution.
+    /// - The governance `admin`: Serves as an emergency veto safeguard during the timelock window or voting period
+    ///   if a proposal is discovered to be malicious or flawed.
+    ///
+    /// Once a proposal is executed, it can never be cancelled.
+    pub fn cancel_proposal(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+    ) -> Result<(), GovernanceError> {
+        caller.require_auth();
+
+        if !env.storage().instance().has(&DataKey::Initialized) {
+            return Err(GovernanceError::NotInitialized);
+        }
+
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(GovernanceError::ProposalNotFound)?;
+
+        if proposal.status == ProposalStatus::Executed {
+            return Err(GovernanceError::CannotCancelExecuted);
+        }
+
+        if proposal.status == ProposalStatus::Cancelled {
+            return Err(GovernanceError::ProposalAlreadyCancelled);
+        }
+
+        if caller != proposal.proposer && caller != admin {
+            return Err(GovernanceError::Unauthorized);
+        }
+
+        proposal.status = ProposalStatus::Cancelled;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_LEDGERS);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Proposal(proposal_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_LEDGERS,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_cancelled"), proposal_id, caller),
             (),
         );
 
@@ -648,6 +785,14 @@ impl GovernanceContract {
         } else {
             Ok(ProposalStatus::Passed)
         }
+    }
+
+    /// Read-only alias for `get_proposal_status` to query the current lifecycle state.
+    pub fn get_proposal_state(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<ProposalStatus, GovernanceError> {
+        Self::get_proposal_status(env, proposal_id)
     }
 
     /// Returns the total token supply of KPRS.
@@ -818,6 +963,7 @@ impl GovernanceContract {
             }
             GovernableAction::PauseRegistry
             | GovernableAction::UnpauseRegistry
+            | GovernableAction::TransferRegistryAdmin(_)
             | GovernableAction::RemoveTreasuryRecipient(_)
             | GovernableAction::PauseTreasury
             | GovernableAction::UnpauseTreasury
